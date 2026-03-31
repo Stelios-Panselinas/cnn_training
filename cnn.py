@@ -6,16 +6,19 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 from sklearn.preprocessing import StandardScaler
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Conv1D, MaxPooling1D, Flatten, Dense, Dropout, GlobalAveragePooling1D, Input
+from tensorflow.keras.layers import Conv1D, MaxPooling1D, Flatten, Dense, Dropout, GlobalAveragePooling1D, Input, BatchNormalization
 from tensorflow.keras.optimizers import Adam
 
-SEQ_LEN = 16
+SEQ_LEN = 32
 TRAIN_RATIO = 0.80
 NUM_CLASSES = 3
 FILTER1 = 3
 FILTER2 = 6
 KERNEL_SIZE = 2
 POOL_SIZE = 2
+DENSE = 4
+BATCH = 4
+EPOCHS = 10
 
 def reduce_wesad_classes(data, binary_classification=False, three_class_classification=False):
     """Reduce the number of classes in the WESAD dataset
@@ -103,7 +106,7 @@ def build_cnn(seq_len, num_features, num_classes=NUM_CLASSES):
 
         GlobalAveragePooling1D(),
 
-        Dense(8, activation='softmax')
+        Dense(DENSE, activation='softmax')
     ])
 
     model.compile(
@@ -132,51 +135,95 @@ def load_data():
 
     return raw_data, feature_cols, label_col
 
-def split_and_prepare_data(data):
-    train_dfs = []
-    test_dfs = []
-
+def split_and_prepare_data(data, option):
     subjects = data['subject'].unique()
+    if(option == '0' or option == '1'):
+        train_dfs = []
+        test_dfs = []
 
-    for sub in subjects:
-        sub_data = data[data['subject'] == sub].reset_index(drop=True)
+        for sub in subjects:
+            sub_data = data[data['subject'] == sub].reset_index(drop=True)
 
-        # split
-        train_data, test_data = split_data(sub_data, train_ratio=TRAIN_RATIO)
+            # split
+            train_data, test_data = split_data(sub_data, train_ratio=TRAIN_RATIO)
 
-        # extract numpy
-        train_x = train_data[feature_cols].values
-        train_y = train_data[label_col].values
+            # extract numpy
+            train_x = train_data[feature_cols].values
+            train_y = train_data[label_col].values
 
-        test_x = test_data[feature_cols].values
-        test_y = test_data[label_col].values
+            test_x = test_data[feature_cols].values
+            test_y = test_data[label_col].values
 
-        # windowing
-        train_x_w, train_y_w = create_windows(train_x, train_y, seq_len=SEQ_LEN)
-        test_x_w, test_y_w = create_windows(test_x, test_y, seq_len=SEQ_LEN)
+            # windowing
+            train_x_w, train_y_w = create_windows(train_x, train_y, seq_len=SEQ_LEN)
+            test_x_w, test_y_w = create_windows(test_x, test_y, seq_len=SEQ_LEN)
 
-        train_x_w, test_x_w, scaler = normalize_data(train_x_w, test_x_w)
-        # create DataFrames for this subject
-        train_df_sub = pd.DataFrame({
-            'subject': sub,
-            'X': list(train_x_w),   # store each window as array
-            'y': train_y_w
+            train_x_w, test_x_w, scaler = normalize_data(train_x_w, test_x_w)
+            # create DataFrames for this subject
+            train_df_sub = pd.DataFrame({
+                'subject': sub,
+                'X': list(train_x_w),   # store each window as array
+                'y': train_y_w
+            })
+
+            test_df_sub = pd.DataFrame({
+                'subject': sub,
+                'X': list(test_x_w),
+                'y': test_y_w
+            })
+
+            train_dfs.append(train_df_sub)
+            test_dfs.append(test_df_sub)
+
+        # concatenate all subjects
+        train_df = pd.concat(train_dfs, ignore_index=True)
+        test_df = pd.concat(test_dfs, ignore_index=True)
+
+        return train_df, test_df
+    elif(option == '2'):
+        test_sub = []
+        test_sub.append(subjects[0])
+        test_sub.append(subjects[1])
+        test_sub.append(subjects[2])
+        test_sub_set = set(test_sub)
+        train_X = []
+        train_Y = []
+        test_X = []
+        test_Y = []
+        train_sub = list(filter(lambda x: x not in test_sub_set, subjects))
+        for sub in train_sub:
+            sub_data = data[data['subject'] == sub]
+            train_x = sub_data[feature_cols].values
+            train_y = sub_data[label_col].values
+            train_x_w, train_y_w = create_windows(train_x, train_y, seq_len=SEQ_LEN)
+            # train_x_w, test_x_w, scaler = normalize_data(train_x_w, test_x_w)
+            train_X.append(train_x_w)
+            train_Y.append(train_y_w)
+        for sub in test_sub:
+            sub_data = data[data['subject'] == sub]
+            test_x = sub_data[feature_cols].values
+            test_y = sub_data[label_col].values
+            test_x_w, test_y_w = create_windows(test_x, test_y, seq_len=SEQ_LEN)
+            # train_x_w, test_x_w, scaler = normalize_data(train_x_w, test_x_w)
+            test_X.append(test_x_w)
+            test_Y.append(test_y_w)
+        train_X = np.concatenate(train_X)
+        train_Y = np.concatenate(train_Y)
+        test_X = np.concatenate(test_X)
+        test_Y = np.concatenate(test_Y)
+        train_X, test_X, scaler = normalize_data(train_X, test_X)
+        train_df = pd.DataFrame({
+                'subject': 'SUB',
+                'X': list(train_X),   # store each window as array
+                'y': train_Y
+            })
+
+        test_df = pd.DataFrame({
+            'subject': 'SUB',
+            'X': list(test_X),
+            'y': test_Y
         })
-
-        test_df_sub = pd.DataFrame({
-            'subject': sub,
-            'X': list(test_x_w),
-            'y': test_y_w
-        })
-
-        train_dfs.append(train_df_sub)
-        test_dfs.append(test_df_sub)
-
-    # concatenate all subjects
-    train_df = pd.concat(train_dfs, ignore_index=True)
-    test_df = pd.concat(test_dfs, ignore_index=True)
-
-    return train_df, test_df
+        return train_df, test_df
 
 def train_model(train_df, test_df, option):
     subjects = train_df['subject'].unique()
@@ -192,8 +239,8 @@ def train_model(train_df, test_df, option):
             history = model.fit(
             train_X, train_Y,
             validation_data=(test_X, test_Y),
-            epochs=10,
-            batch_size=32,
+            epochs=EPOCHS,
+            batch_size=BATCH,
             verbose=1
             )
     elif(option == '1'):    
@@ -209,19 +256,29 @@ def train_model(train_df, test_df, option):
         history = model.fit(
         train_X, train_Y,
         validation_data=(test_X, test_Y),
-        epochs=10,
-        batch_size=32,
+        epochs=EPOCHS,
+        batch_size=BATCH,
         verbose=1
         )
-    # test_loss, test_acc = model.evaluate(test_X, test_Y, verbose=0)
-    # print("Test accuracy:", test_acc)
+    elif(option == '2'):
+        train_X = np.stack(train_df['X'].values)
+        train_Y = train_df['y'].values
+
+        test_X = np.stack(test_df['X'].values)
+        test_Y = test_df['y'].values
+
+        model = build_cnn(seq_len=SEQ_LEN, num_features=8, num_classes=NUM_CLASSES)
+        history = model.fit(
+        train_X, train_Y,
+        validation_data=(test_X, test_Y),
+        epochs=EPOCHS,
+        batch_size=BATCH,
+        verbose=1
+        )
     return model
         
-    
-
 if __name__ == "__main__":  
-    option = sys.argv[1]     
-    print(option)
+    option = sys.argv[1]
     data, feature_cols, label_col = load_data()
-    train_df, test_df = split_and_prepare_data(data)
+    train_df, test_df = split_and_prepare_data(data, option)
     model = train_model(train_df, test_df, option)
