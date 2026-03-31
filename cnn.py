@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 import os
+import sys
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 from sklearn.preprocessing import StandardScaler
@@ -126,63 +127,101 @@ def load_data():
     print('Downsampling data...')
     raw_data = raw_data.iloc[::4].reset_index(drop=True)
     print(f'downsampled shape: ', raw_data.shape)
-    subjects = raw_data['subject'].unique()
     feature_cols = ['ax', 'ay', 'az', 'emg', 'temp', 'eda', 'ecg', 'resp']
     label_col = 'label'
 
-    train_X = []
-    train_Y = []
-    test_X = []
-    test_Y = []
+    return raw_data, feature_cols, label_col
+
+def split_and_prepare_data(data):
+    train_dfs = []
+    test_dfs = []
+
+    subjects = data['subject'].unique()
+
     for sub in subjects:
-        sub_data = raw_data[raw_data['subject'] == sub].reset_index(drop=True)
-        # παίρνουμε το 80% από κάθε subject για train και 20% για test
+        sub_data = data[data['subject'] == sub].reset_index(drop=True)
+
+        # split
         train_data, test_data = split_data(sub_data, train_ratio=TRAIN_RATIO)
 
+        # extract numpy
         train_x = train_data[feature_cols].values
         train_y = train_data[label_col].values
 
         test_x = test_data[feature_cols].values
         test_y = test_data[label_col].values
 
-        if(len(train_x) != len(train_y)):
-            print('X data are not equal with Y data')
-
-        # χωρίζουμε σε παράθυρα το train και το test
+        # windowing
         train_x_w, train_y_w = create_windows(train_x, train_y, seq_len=SEQ_LEN)
         test_x_w, test_y_w = create_windows(test_x, test_y, seq_len=SEQ_LEN)
-        
-        # προσθέτουμε τα καινούργια παράθυρα στην λίστα με τα παράθυρα από κάθε subject
-        train_X.append(train_x_w)
-        train_Y.append(train_y_w)
-        test_X.append(test_x_w)
-        test_Y.append(test_y_w)
 
         train_x_w, test_x_w, scaler = normalize_data(train_x_w, test_x_w)
+        # create DataFrames for this subject
+        train_df_sub = pd.DataFrame({
+            'subject': sub,
+            'X': list(train_x_w),   # store each window as array
+            'y': train_y_w
+        })
+
+        test_df_sub = pd.DataFrame({
+            'subject': sub,
+            'X': list(test_x_w),
+            'y': test_y_w
+        })
+
+        train_dfs.append(train_df_sub)
+        test_dfs.append(test_df_sub)
+
+    # concatenate all subjects
+    train_df = pd.concat(train_dfs, ignore_index=True)
+    test_df = pd.concat(test_dfs, ignore_index=True)
+
+    return train_df, test_df
+
+def train_model(train_df, test_df, option):
+    subjects = train_df['subject'].unique()
+    if(option == '0'):
+        for sub in subjects:
+            train_X = np.stack(train_df[train_df['subject'] == sub]['X'])
+            train_Y = np.stack(train_df[train_df['subject'] == sub]['y'])
+
+            test_X = np.stack(test_df[test_df['subject'] == sub]['X'])
+            test_X = np.stack(test_df[test_df['subject'] == sub]['y'])
+
+            model = build_cnn(seq_len=SEQ_LEN, num_features=8, num_classes=NUM_CLASSES)
+            history = model.fit(
+            train_X, train_Y,
+            validation_data=(test_X, test_Y),
+            epochs=10,
+            batch_size=32,
+            verbose=1
+            )
+    elif(option == '1'):    
+        train_X = np.stack(train_df['X'].values)
+        train_Y = train_df['y'].values
+
+        test_X = np.stack(test_df['X'].values)
+        test_Y = test_df['y'].values
+
+        
         #.........
         model = build_cnn(seq_len=SEQ_LEN, num_features=8, num_classes=NUM_CLASSES)
         history = model.fit(
-        train_x_w, train_y_w,
-        validation_data=(test_x_w, test_y_w),
+        train_X, train_Y,
+        validation_data=(test_X, test_Y),
         epochs=10,
         batch_size=32,
         verbose=1
         )
-        # test_loss, test_acc = model.evaluate(test_X, test_Y, verbose=0)
-        # print("Test accuracy:", test_acc)
+    # test_loss, test_acc = model.evaluate(test_X, test_Y, verbose=0)
+    # print("Test accuracy:", test_acc)
+    return model
         
-    # κανονικοποιούμε τα δεδομένα μας
-    train_X = np.concatenate(train_X)
-    train_Y = np.concatenate(train_Y)
-    test_X = np.concatenate(test_X)
-    test_Y = np.concatenate(test_Y)
-
-    print("train X shape:", train_X.shape)
-    print("train y shape:", train_Y.shape)
-    print("test X shape:", test_X.shape)
-    print("test y shape:", test_Y.shape)
-    train_X, test_X, scaler = normalize_data(train_X, test_X)
     
 
-if __name__ == "__main__":       
-    load_data()
+if __name__ == "__main__":  
+    option = sys.argv[1]     
+    print(option)
+    data, feature_cols, label_col = load_data()
+    train_df, test_df = split_and_prepare_data(data)
+    model = train_model(train_df, test_df, option)
