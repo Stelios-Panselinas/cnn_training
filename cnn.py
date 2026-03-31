@@ -1,9 +1,20 @@
 import pandas as pd
 import numpy as np
+import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 from sklearn.preprocessing import StandardScaler
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Conv1D, MaxPooling1D, Flatten, Dense, Dropout, GlobalAveragePooling1D, Input
+from tensorflow.keras.optimizers import Adam
 
 SEQ_LEN = 16
 TRAIN_RATIO = 0.80
+NUM_CLASSES = 3
+FILTER1 = 3
+FILTER2 = 6
+KERNEL_SIZE = 2
+POOL_SIZE = 2
 
 def reduce_wesad_classes(data, binary_classification=False, three_class_classification=False):
     """Reduce the number of classes in the WESAD dataset
@@ -75,6 +86,33 @@ def normalize_data(X_train, X_test):
 
     return X_train, X_test, scaler
 
+def build_cnn(seq_len, num_features, num_classes=NUM_CLASSES):
+    model = Sequential([
+        Input(shape=(seq_len, num_features)),
+
+        Conv1D(filters=FILTER1, kernel_size=KERNEL_SIZE, activation='relu', padding='same'),
+        # BatchNormalization(),
+        MaxPooling1D(pool_size=POOL_SIZE),
+
+        Conv1D(filters=FILTER2, kernel_size=KERNEL_SIZE, activation='relu', padding='same'),
+        # BatchNormalization(),
+        # MaxPooling1D(pool_size=2),
+
+        # BatchNormalization(),
+
+        GlobalAveragePooling1D(),
+
+        Dense(8, activation='softmax')
+    ])
+
+    model.compile(
+        optimizer=Adam(learning_rate=1e-3),
+        loss='sparse_categorical_crossentropy',
+        metrics=['accuracy']
+    )
+
+    return model
+
 def load_data():
     print("Loading data...")
     raw_data = pd.read_csv('./wesad_extracted.csv')
@@ -119,18 +157,32 @@ def load_data():
         train_Y.append(train_y_w)
         test_X.append(test_x_w)
         test_Y.append(test_y_w)
+
+        train_x_w, test_x_w, scaler = normalize_data(train_x_w, test_x_w)
+        #.........
+        model = build_cnn(seq_len=SEQ_LEN, num_features=8, num_classes=NUM_CLASSES)
+        history = model.fit(
+        train_x_w, train_y_w,
+        validation_data=(test_x_w, test_y_w),
+        epochs=10,
+        batch_size=32,
+        verbose=1
+        )
+        # test_loss, test_acc = model.evaluate(test_X, test_Y, verbose=0)
+        # print("Test accuracy:", test_acc)
+        
     # κανονικοποιούμε τα δεδομένα μας
     train_X = np.concatenate(train_X)
-    train_y = np.concatenate(train_Y)
+    train_Y = np.concatenate(train_Y)
     test_X = np.concatenate(test_X)
-    test_y = np.concatenate(test_Y)
+    test_Y = np.concatenate(test_Y)
 
     print("train X shape:", train_X.shape)
-    print("train y shape:", train_y.shape)
+    print("train y shape:", train_Y.shape)
     print("test X shape:", test_X.shape)
-    print("test y shape:", test_y.shape)
+    print("test y shape:", test_Y.shape)
     train_X, test_X, scaler = normalize_data(train_X, test_X)
+    
 
-        
-
-load_data()
+if __name__ == "__main__":       
+    load_data()
