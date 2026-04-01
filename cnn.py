@@ -5,6 +5,7 @@ import sys
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 from sklearn.preprocessing import StandardScaler
+import tensorflow as tf
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Conv1D, MaxPooling1D, Flatten, Dense, Dropout, GlobalAveragePooling1D, Input, BatchNormalization
 from tensorflow.keras.optimizers import Adam
@@ -18,7 +19,7 @@ KERNEL_SIZE = 2
 POOL_SIZE = 2
 DENSE = 4
 BATCH = 4
-EPOCHS = 10
+EPOCHS = 50
 
 def reduce_wesad_classes(data, binary_classification=False, three_class_classification=False):
     """Reduce the number of classes in the WESAD dataset
@@ -61,6 +62,7 @@ def create_windows(x, y, seq_len):
 
     X_windows = np.array(X_windows)
     y_labels = np.array(y_labels)
+    
 
     return X_windows, y_labels
 
@@ -70,6 +72,7 @@ def split_data(df_sub, train_ratio):
 
     train_df = df_sub.iloc[:split]
     test_df = df_sub.iloc[split:]
+    print('test y', test_df['label'].unique())
     
     return train_df, test_df
 
@@ -185,6 +188,8 @@ def split_and_prepare_data(data, option):
         test_sub.append(subjects[0])
         test_sub.append(subjects[1])
         test_sub.append(subjects[2])
+        test_sub.append(subjects[4])
+        test_sub.append(subjects[3])
         test_sub_set = set(test_sub)
         train_X = []
         train_Y = []
@@ -223,6 +228,7 @@ def split_and_prepare_data(data, option):
             'X': list(test_X),
             'y': test_Y
         })
+        print(f'y test:{test_df['y'].unique()} y train:{train_df['y'].unique()}')
         return train_df, test_df
 
 def train_model(train_df, test_df, option):
@@ -276,9 +282,108 @@ def train_model(train_df, test_df, option):
         verbose=1
         )
     return model
-        
+
+def export_tflite_model(model, train_X):
+    converter = tf.lite.TFLiteConverter.from_keras_model(model)
+    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+
+    # full integer quantization
+    converter.representative_dataset = representative_data_gen(train_X)
+    converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+    converter.inference_input_type = tf.int8
+    converter.inference_output_type = tf.int8
+
+    tflite_model = converter.convert()
+
+    with open("model_int8.tflite", "wb") as f:
+        f.write(tflite_model)
+
+    print("Saved fully quantized TFLite model: model_int8.tflite")
+
+    interpreter = tf.lite.Interpreter(model_path=f"model_int8.tflite")
+    interpreter.allocate_tensors()
+
+    input_details = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
+
+    input_scale, input_zero_point = input_details[0]['quantization']
+    output_scale, output_zero_point = output_details[0]['quantization']
+
+    print("Input scale:", input_scale)
+    print("Input zero point:", input_zero_point)
+    print("Output scale:", output_scale)
+    print("Output zero point:", output_zero_point)
+
+def representative_data_gen(train_X):
+    num_samples = min(100, len(train_X))
+    for i in range(num_samples):
+        sample = train_X[i:i+1].astype(np.float32)
+        yield [sample]
+
+def pack_int4_pair(low, high):
+    low_u = np.uint8(low & 0x0F)
+    high_u = np.uint8(high & 0x0F)
+    return np.uint8(low_u | (high_u << 4))
+
+import numpy as np
+import tensorflow as tf
+
+def export_wesad_eval_header(test_x, test_y, tflite_model_path, output_file="wesad_eval_data.h"):
+    interpreter = tf.lite.Interpreter(model_path=tflite_model_path)
+    interpreter.allocate_tensors()
+
+    input_details = interpreter.get_input_details()
+    input_scale, input_zero_point = input_details[0]['quantization']
+
+    print("TFLite input scale:", input_scale)
+    print("TFLite input zero point:", input_zero_point)
+
+    test_x_q = np.round(test_x / input_scale + input_zero_point)
+    test_x_q = np.clip(test_x_q, -128, 127).astype(np.int8)
+
+    num_samples = test_x_q.shape[0]
+    seq_len = test_x_q.shape[1]
+    num_features = test_x_q.shape[2]
+    sample_len = seq_len * num_features
+
+    test_x_flat = test_x_q.reshape(num_samples, sample_len)
+
+    with open(output_file, "w") as f:
+        f.write("#ifndef WESAD_EVAL_DATA_H_\n")
+        f.write("#define WESAD_EVAL_DATA_H_\n\n")
+        f.write("#include <stdint.h>\n\n")
+
+        f.write(f"const int g_wesad_eval_num_samples = {num_samples};\n")
+        f.write(f"const int g_wesad_eval_sample_len = {sample_len};\n\n")
+
+        f.write("const int8_t g_wesad_eval_x[] = {\n")
+        for s in range(num_samples):
+            f.write("  ")
+            for i, val in enumerate(test_x_flat[s]):
+                f.write(f"{int(val)}")
+                if not (s == num_samples - 1 and i == sample_len - 1):
+                    f.write(",")
+                f.write(" ")
+            f.write("\n")
+        f.write("};\n\n")
+
+        f.write("const uint8_t g_wesad_eval_y[] = {\n  ")
+        for i, label in enumerate(test_y):
+            f.write(f"{int(label)}")
+            if i != len(test_y) - 1:
+                f.write(", ")
+        f.write("\n};\n\n")
+
+        f.write("#endif\n")
+
 if __name__ == "__main__":  
     option = sys.argv[1]
     data, feature_cols, label_col = load_data()
     train_df, test_df = split_and_prepare_data(data, option)
     model = train_model(train_df, test_df, option)
+
+    train_X = np.stack(train_df['X'].values)
+    test_X = np.stack(test_df['X'].values)
+    test_Y = test_df['y'].values
+    export_wesad_eval_header(test_X, test_Y, tflite_model_path=f"model_int8.tflite", output_file="wesad_eval_data.h")
+    export_tflite_model(model, train_X)
