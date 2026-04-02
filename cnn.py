@@ -247,6 +247,7 @@ def train_model(train_df, test_df, option):
             validation_data=(test_X, test_Y),
             epochs=EPOCHS,
             batch_size=BATCH,
+            shuffle=True,
             verbose=1
             )
     elif(option == '1'):    
@@ -324,9 +325,6 @@ def pack_int4_pair(low, high):
     low_u = np.uint8(low & 0x0F)
     high_u = np.uint8(high & 0x0F)
     return np.uint8(low_u | (high_u << 4))
-
-import numpy as np
-import tensorflow as tf
 
 def export_wesad_eval_header(test_x, test_y, tflite_model_path, output_file="wesad_eval_data.h"):
     interpreter = tf.lite.Interpreter(model_path=tflite_model_path)
