@@ -9,6 +9,8 @@ import tensorflow as tf
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Conv1D, MaxPooling1D, Flatten, Dense, Dropout, GlobalAveragePooling1D, Input, BatchNormalization
 from tensorflow.keras.optimizers import Adam
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.metrics import confusion_matrix, classification_report
 
 SEQ_LEN = 32
 TRAIN_RATIO = 0.80
@@ -72,7 +74,6 @@ def split_data(df_sub, train_ratio):
 
     train_df = df_sub.iloc[:split]
     test_df = df_sub.iloc[split:]
-    print('test y', test_df['label'].unique())
     
     return train_df, test_df
 
@@ -225,6 +226,7 @@ def split_and_prepare_data(data, option):
             sub_data = data[data['subject'] == sub]
             train_x = sub_data[feature_cols].values
             train_y = sub_data[label_col].values
+            classes = np.unique(train_y)
             train_x_w, train_y_w = create_windows(train_x, train_y, seq_len=SEQ_LEN)
             history = model.fit(train_x_w, train_y_w, validation_data=(test_X, test_Y), epochs=EPOCHS, batch_size=BATCH, shuffle=True, verbose=1)
             # train_x_w, test_x_w, scaler = normalize_data(train_x_w, test_x_w)
@@ -235,6 +237,11 @@ def split_and_prepare_data(data, option):
             
         loss, accuracy = model.evaluate(eval_X, eval_Y)
         print("Test accuracy:", accuracy)
+        y_pred_probs = model.predict(eval_X)
+        y_pred = np.argmax(y_pred_probs, axis=1)
+        cm = confusion_matrix(eval_Y, y_pred)
+        print("Confusion Matrix:\n", cm)
+        print(classification_report(eval_Y, y_pred, digits=4))
         # train_X = np.concatenate(train_X)
         # train_Y = np.concatenate(train_Y)
         
@@ -250,7 +257,6 @@ def split_and_prepare_data(data, option):
             'X': list(test_X),
             'y': test_Y
         })
-        print(f'y test:{test_df['y'].unique()} y train:{train_df['y'].unique()}')
         return train_df, test_df
 
 def train_model(train_df, test_df, option):
@@ -288,6 +294,11 @@ def train_model(train_df, test_df, option):
         batch_size=BATCH,
         verbose=1
         )
+        y_pred_probs = model.predict(test_X)
+        y_pred = np.argmax(y_pred_probs, axis=1)
+        cm = confusion_matrix(test_Y, y_pred)
+        print("Confusion Matrix:\n", cm)
+        print(classification_report(test_Y, y_pred, digits=4))
     elif(option == '2'):
         train_X = np.stack(train_df['X'].values)
         train_Y = train_df['y'].values
