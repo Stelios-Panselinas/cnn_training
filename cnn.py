@@ -9,17 +9,19 @@ import tensorflow as tf
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import Conv1D, MaxPooling1D, Flatten, Dense, Dropout, GlobalAveragePooling1D, Input, BatchNormalization
 from tensorflow.keras.optimizers import Adam
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.metrics import confusion_matrix, classification_report
 
 SEQ_LEN = 32
 TRAIN_RATIO = 0.80
 NUM_CLASSES = 3
-FILTER1 = 3
-FILTER2 = 6
+FILTER1 = 8
+FILTER2 = 4
 KERNEL_SIZE = 2
-POOL_SIZE = 2
+POOL_SIZE = 3
 DENSE = 4
 BATCH = 4
-EPOCHS = 50
+EPOCHS = 10
 
 def reduce_wesad_classes(data, binary_classification=False, three_class_classification=False):
     """Reduce the number of classes in the WESAD dataset
@@ -72,7 +74,6 @@ def split_data(df_sub, train_ratio):
 
     train_df = df_sub.iloc[:split]
     test_df = df_sub.iloc[split:]
-    print('test y', test_df['label'].unique())
     
     return train_df, test_df
 
@@ -109,7 +110,7 @@ def build_cnn(seq_len, num_features, num_classes=NUM_CLASSES):
 
         GlobalAveragePooling1D(),
 
-        Dense(DENSE, activation='softmax')
+        Dense(3, activation='softmax')
     ])
 
     model.compile(
@@ -146,20 +147,20 @@ def split_and_prepare_data(data, option):
 
         for sub in subjects:
             sub_data = data[data['subject'] == sub].reset_index(drop=True)
+            sub_y_data = sub_data[label_col].values
+            sub_x_data = sub_data[feature_cols].values
+            sub_x_data, sub_y_data = create_windows(sub_x_data, sub_y_data, seq_len=SEQ_LEN)
 
-            # split
-            train_data, test_data = split_data(sub_data, train_ratio=TRAIN_RATIO)
+            indices = np.random.permutation(sub_x_data.shape[0])
+            sub_x_data = sub_x_data[indices]
+            sub_y_data = sub_y_data[indices]
+            print(f'length of sub_x_data: {len(sub_x_data)} and length of sub_y_data: {len(sub_y_data)}')
 
-            # extract numpy
-            train_x = train_data[feature_cols].values
-            train_y = train_data[label_col].values
-
-            test_x = test_data[feature_cols].values
-            test_y = test_data[label_col].values
-
-            # windowing
-            train_x_w, train_y_w = create_windows(train_x, train_y, seq_len=SEQ_LEN)
-            test_x_w, test_y_w = create_windows(test_x, test_y, seq_len=SEQ_LEN)
+            slipt = int(len(sub_x_data) * TRAIN_RATIO)
+            train_x_w = sub_x_data[:slipt]
+            train_y_w = sub_y_data[:slipt]
+            test_x_w = sub_x_data[slipt:]
+            test_y_w = sub_y_data[slipt:]
 
             train_x_w, test_x_w, scaler = normalize_data(train_x_w, test_x_w)
             # create DataFrames for this subject
@@ -181,8 +182,11 @@ def split_and_prepare_data(data, option):
         # concatenate all subjects
         train_df = pd.concat(train_dfs, ignore_index=True)
         test_df = pd.concat(test_dfs, ignore_index=True)
-
+        
+        print(f'y test:{test_df['y'].unique()} y train:{train_df['y'].unique()}')
+        print(f'distribution of y test: {test_df['y'].value_counts()} distribution of y train: {train_df['y'].value_counts()}')
         return train_df, test_df
+    
     elif(option == '2'):
         test_sub = []
         test_sub.append(subjects[0])
@@ -228,7 +232,6 @@ def split_and_prepare_data(data, option):
             'X': list(test_X),
             'y': test_Y
         })
-        print(f'y test:{test_df['y'].unique()} y train:{train_df['y'].unique()}')
         return train_df, test_df
 
 def train_model(train_df, test_df, option):
@@ -267,6 +270,11 @@ def train_model(train_df, test_df, option):
         batch_size=BATCH,
         verbose=1
         )
+        y_pred_probs = model.predict(test_X)
+        y_pred = np.argmax(y_pred_probs, axis=1)
+        cm = confusion_matrix(test_Y, y_pred)
+        print("Confusion Matrix:\n", cm)
+        print(classification_report(test_Y, y_pred, digits=4))
     elif(option == '2'):
         train_X = np.stack(train_df['X'].values)
         train_Y = train_df['y'].values
@@ -289,7 +297,7 @@ def export_tflite_model(model, train_X):
     converter.optimizations = [tf.lite.Optimize.DEFAULT]
 
     # full integer quantization
-    converter.representative_dataset = representative_data_gen(train_X)
+    converter.representative_dataset = representative_data_gen
     converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
     converter.inference_input_type = tf.int8
     converter.inference_output_type = tf.int8
@@ -315,7 +323,7 @@ def export_tflite_model(model, train_X):
     print("Output scale:", output_scale)
     print("Output zero point:", output_zero_point)
 
-def representative_data_gen(train_X):
+def representative_data_gen():
     num_samples = min(100, len(train_X))
     for i in range(num_samples):
         sample = train_X[i:i+1].astype(np.float32)
