@@ -1,0 +1,481 @@
+import pandas as pd
+import numpy as np
+import os
+import sys
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
+
+from sklearn.preprocessing import StandardScaler
+import tensorflow as tf
+from tensorflow.keras.models import Sequential
+from tensorflow.keras.layers import Conv1D, MaxPooling1D, Flatten, Dense, Dropout, GlobalAveragePooling1D, Input, BatchNormalization
+from tensorflow.keras.optimizers import Adam
+from sklearn.utils.class_weight import compute_class_weight
+from sklearn.metrics import confusion_matrix, classification_report
+import optuna   # ADDED
+
+SEQ_LEN = 32
+TRAIN_RATIO = 0.80
+NUM_CLASSES = 3
+FILTER1 = 8
+FILTER2 = 16
+KERNEL_SIZE = 2
+POOL_SIZE = 2
+DENSE = 4
+BATCH = 4
+EPOCHS = 10
+
+def reduce_wesad_classes(data, binary_classification=False, three_class_classification=False):
+    """Reduce the number of classes in the WESAD dataset
+        In preprocessing (basic_seg): if labels[idx] not in [1, 2, 3]
+        8 classes in total:
+            0: baseline -> Keep for binary/three-class classification
+            1: stress -> Keep for binary/three-class classification
+            2: amusement -> Keep for three-class classification / Transform to 0 for binary classification
+            3: meditation1
+            4: rest
+            5: meditation2
+            6: ??
+            7: ??
+    """
+    if not binary_classification and not three_class_classification:
+        return data
+
+    selected_classes = sorted(data['label'].unique())[:3]
+    data = data[data['label'].isin(selected_classes)]
+
+    if binary_classification:
+        data = data.replace({'label': 2}, {'label': 0})
+    return data
+
+def create_windows(x, y, seq_len):
+    X_windows = []
+    y_labels = []
+    step = seq_len
+    for start in range(0, len(x) - seq_len + 1, step):
+        end = start + seq_len
+        window_x = x[start:end]
+        window_y = y[start:end]
+
+        X_windows.append(window_x)
+        values, counts = np.unique(window_y, return_counts=True)
+        y_labels.append(values[np.argmax(counts)])
+
+    X_windows = np.array(X_windows)
+    y_labels = np.array(y_labels)
+
+    return X_windows, y_labels
+
+def split_data(df_sub, train_ratio):
+    split = int(len(df_sub) * train_ratio)
+    train_df = df_sub.iloc[:split]
+    test_df = df_sub.iloc[split:]
+    return train_df, test_df
+
+def normalize_data(X_train, X_test):
+    n_train, seq_len, n_feat = X_train.shape
+    n_test = X_test.shape[0]
+
+    X_train_2d = X_train.reshape(-1, n_feat)
+    X_test_2d  = X_test.reshape(-1, n_feat)
+
+    scaler = StandardScaler()
+    X_train_2d = scaler.fit_transform(X_train_2d)
+    X_test_2d = scaler.transform(X_test_2d)
+
+    X_train = X_train_2d.reshape(n_train, seq_len, n_feat)
+    X_test  = X_test_2d.reshape(n_test, seq_len, n_feat)
+
+    return X_train, X_test, scaler
+
+# MODIFIED: hyperparameters can now be passed from Optuna
+def build_cnn(seq_len, num_features, num_classes=NUM_CLASSES,
+              filter1=FILTER1, filter2=FILTER2,
+              kernel_size=KERNEL_SIZE, pool_size=POOL_SIZE,
+              dense_units=DENSE, learning_rate=1e-3):
+    model = Sequential([
+        Input(shape=(seq_len, num_features)),
+
+        Conv1D(filters=filter1, kernel_size=kernel_size, activation='relu', padding='same'),
+        MaxPooling1D(pool_size=pool_size),
+
+        Conv1D(filters=filter2, kernel_size=kernel_size, activation='relu', padding='same'),
+
+        GlobalAveragePooling1D(),
+
+        Dense(dense_units, activation='relu'),
+        Dense(num_classes, activation='softmax')
+    ])
+
+    model.compile(
+        optimizer=Adam(learning_rate=learning_rate),
+        loss='sparse_categorical_crossentropy',
+        metrics=['accuracy']
+    )
+
+    return model
+
+def load_data():
+    print("Loading data...")
+    raw_data = pd.read_csv('./wesad_extracted.csv')
+
+    print("Reducing classes to 3...")
+    raw_data = reduce_wesad_classes(raw_data, False, True)
+    
+    print('Selecting chest signals...')
+    raw_data = raw_data.drop(columns=[column for column in raw_data.columns if 'wrist' in column])
+    
+    print('Downsampling data...')
+    raw_data = raw_data.iloc[::4].reset_index(drop=True)
+    print(f'downsampled shape: ', raw_data.shape)
+
+    feature_cols = ['ax', 'ay', 'az', 'emg', 'temp', 'eda', 'ecg', 'resp']
+    label_col = 'label'
+
+    return raw_data, feature_cols, label_col
+
+def split_and_prepare_data(data, option):
+    subjects = data['subject'].unique()
+
+    if(option == '0' or option == '1'):
+        train_dfs = []
+        test_dfs = []
+
+        for sub in subjects:
+            sub_data = data[data['subject'] == sub].reset_index(drop=True)
+            sub_y_data = sub_data[label_col].values
+            sub_x_data = sub_data[feature_cols].values
+
+            sub_x_data, sub_y_data = create_windows(sub_x_data, sub_y_data, seq_len=SEQ_LEN)
+
+            indices = np.random.permutation(sub_x_data.shape[0])
+            sub_x_data = sub_x_data[indices]
+            sub_y_data = sub_y_data[indices]
+
+            split = int(len(sub_x_data) * TRAIN_RATIO)
+            train_x_w = sub_x_data[:split]
+            train_y_w = sub_y_data[:split]
+            test_x_w = sub_x_data[split:]
+            test_y_w = sub_y_data[split:]
+
+            train_x_w, test_x_w, scaler = normalize_data(train_x_w, test_x_w)
+
+            train_df_sub = pd.DataFrame({
+                'subject': sub,
+                'X': list(train_x_w),
+                'y': train_y_w
+            })
+
+            test_df_sub = pd.DataFrame({
+                'subject': sub,
+                'X': list(test_x_w),
+                'y': test_y_w
+            })
+
+            train_dfs.append(train_df_sub)
+            test_dfs.append(test_df_sub)
+
+        train_df = pd.concat(train_dfs, ignore_index=True)
+        test_df = pd.concat(test_dfs, ignore_index=True)
+        
+        print(f"y test:{test_df['y'].unique()} y train:{train_df['y'].unique()}")
+        print(f"distribution of y test: {test_df['y'].value_counts()} distribution of y train: {train_df['y'].value_counts()}")
+        return train_df, test_df
+    
+    elif(option == '2'):
+        test_sub = []
+        test_sub.append(subjects[0])
+        test_sub.append(subjects[1])
+        test_sub.append(subjects[2])
+        test_sub.append(subjects[4])
+        test_sub.append(subjects[3])
+
+        test_sub_set = set(test_sub)
+        train_X = []
+        train_Y = []
+        test_X = []
+        test_Y = []
+
+        train_sub = list(filter(lambda x: x not in test_sub_set, subjects))
+
+        for sub in train_sub:
+            sub_data = data[data['subject'] == sub]
+            train_x = sub_data[feature_cols].values
+            train_y = sub_data[label_col].values
+            train_x_w, train_y_w = create_windows(train_x, train_y, seq_len=SEQ_LEN)
+            train_X.append(train_x_w)
+            train_Y.append(train_y_w)
+
+        for sub in test_sub:
+            sub_data = data[data['subject'] == sub]
+            test_x = sub_data[feature_cols].values
+            test_y = sub_data[label_col].values
+            test_x_w, test_y_w = create_windows(test_x, test_y, seq_len=SEQ_LEN)
+            test_X.append(test_x_w)
+            test_Y.append(test_y_w)
+
+        train_X = np.concatenate(train_X)
+        train_Y = np.concatenate(train_Y)
+        test_X = np.concatenate(test_X)
+        test_Y = np.concatenate(test_Y)
+
+        train_X, test_X, scaler = normalize_data(train_X, test_X)
+
+        train_df = pd.DataFrame({
+            'subject': 'SUB',
+            'X': list(train_X),
+            'y': train_Y
+        })
+
+        test_df = pd.DataFrame({
+            'subject': 'SUB',
+            'X': list(test_X),
+            'y': test_Y
+        })
+        return train_df, test_df
+
+# ADDED
+def objective(trial, train_X, train_Y, test_X, test_Y, num_features):
+    filter1 = trial.suggest_categorical("filter1", [4, 8, 16, 32])
+    filter2 = trial.suggest_categorical("filter2", [8, 16, 32, 64])
+    kernel_size = trial.suggest_categorical("kernel_size", [2, 3, 5])
+    pool_size = trial.suggest_categorical("pool_size", [2, 4])
+    dense_units = trial.suggest_categorical("dense_units", [4, 8, 16, 32])
+    learning_rate = trial.suggest_float("learning_rate", 1e-4, 1e-2, log=True)
+    batch_size = trial.suggest_categorical("batch_size", [4, 8, 16, 32])
+
+    model = build_cnn(
+        seq_len=SEQ_LEN,
+        num_features=num_features,
+        num_classes=NUM_CLASSES,
+        filter1=filter1,
+        filter2=filter2,
+        kernel_size=kernel_size,
+        pool_size=pool_size,
+        dense_units=dense_units,
+        learning_rate=learning_rate
+    )
+
+    history = model.fit(
+        train_X, train_Y,
+        validation_data=(test_X, test_Y),
+        epochs=5,   # small for faster Optuna search
+        batch_size=batch_size,
+        verbose=0
+    )
+
+    val_acc = max(history.history['val_accuracy'])
+    return val_acc
+
+# ADDED
+def optimize_with_optuna(train_X, train_Y, test_X, test_Y, num_features, n_trials=20):
+    study = optuna.create_study(direction="maximize")
+    study.optimize(
+        lambda trial: objective(trial, train_X, train_Y, test_X, test_Y, num_features),
+        n_trials=n_trials
+    )
+
+    print("Best trial:")
+    print("  Value (val_accuracy):", study.best_trial.value)
+    print("  Params:")
+    for key, value in study.best_trial.params.items():
+        print(f"    {key}: {value}")
+
+    return study.best_trial.params
+
+def train_model(train_df, test_df, option):
+    subjects = train_df['subject'].unique()
+
+    if(option == '0'):
+        for sub in subjects:
+            train_X = np.stack(train_df[train_df['subject'] == sub]['X'])
+            train_Y = np.stack(train_df[train_df['subject'] == sub]['y'])
+
+            test_X = np.stack(test_df[test_df['subject'] == sub]['X'])
+            test_Y = np.stack(test_df[test_df['subject'] == sub]['y'])   # FIXED
+
+            model = build_cnn(seq_len=SEQ_LEN, num_features=8, num_classes=NUM_CLASSES)
+            history = model.fit(
+                train_X, train_Y,
+                validation_data=(test_X, test_Y),
+                epochs=EPOCHS,
+                batch_size=BATCH,
+                shuffle=True,
+                verbose=1
+            )
+
+    elif(option == '1'):
+        train_X = np.stack(train_df['X'].values)
+        train_Y = train_df['y'].values
+
+        test_X = np.stack(test_df['X'].values)
+        test_Y = test_df['y'].values
+
+        # ADDED: Optuna optimization
+        best_params = optimize_with_optuna(train_X, train_Y, test_X, test_Y, num_features=8, n_trials=20)
+
+        model = build_cnn(
+            seq_len=SEQ_LEN,
+            num_features=8,
+            num_classes=NUM_CLASSES,
+            filter1=best_params["filter1"],
+            filter2=best_params["filter2"],
+            kernel_size=best_params["kernel_size"],
+            pool_size=best_params["pool_size"],
+            dense_units=best_params["dense_units"],
+            learning_rate=best_params["learning_rate"]
+        )
+
+        history = model.fit(
+            train_X, train_Y,
+            validation_data=(test_X, test_Y),
+            epochs=EPOCHS,
+            batch_size=best_params["batch_size"],
+            verbose=1
+        )
+
+        y_pred_probs = model.predict(test_X)
+        y_pred = np.argmax(y_pred_probs, axis=1)
+        cm = confusion_matrix(test_Y, y_pred)
+        print("Confusion Matrix:\n", cm)
+        print(classification_report(test_Y, y_pred, digits=4))
+
+    elif(option == '2'):
+        train_X = np.stack(train_df['X'].values)
+        train_Y = train_df['y'].values
+
+        test_X = np.stack(test_df['X'].values)
+        test_Y = test_df['y'].values
+
+        # ADDED: Optuna optimization
+        best_params = optimize_with_optuna(train_X, train_Y, test_X, test_Y, num_features=8, n_trials=20)
+
+        model = build_cnn(
+            seq_len=SEQ_LEN,
+            num_features=8,
+            num_classes=NUM_CLASSES,
+            filter1=best_params["filter1"],
+            filter2=best_params["filter2"],
+            kernel_size=best_params["kernel_size"],
+            pool_size=best_params["pool_size"],
+            dense_units=best_params["dense_units"],
+            learning_rate=best_params["learning_rate"]
+        )
+
+        history = model.fit(
+            train_X, train_Y,
+            validation_data=(test_X, test_Y),
+            epochs=EPOCHS,
+            batch_size=best_params["batch_size"],
+            verbose=1
+        )
+
+    return model
+
+def export_tflite_model(model, train_X):
+    converter = tf.lite.TFLiteConverter.from_keras_model(model)
+    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+
+    # make train_X visible to representative_data_gen
+    global representative_train_X
+    representative_train_X = train_X
+
+    converter.representative_dataset = representative_data_gen
+    converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+    converter.inference_input_type = tf.int8
+    converter.inference_output_type = tf.int8
+
+    tflite_model = converter.convert()
+
+    with open("model_int8.tflite", "wb") as f:
+        f.write(tflite_model)
+
+    print("Saved fully quantized TFLite model: model_int8.tflite")
+
+    interpreter = tf.lite.Interpreter(model_path="model_int8.tflite")
+    interpreter.allocate_tensors()
+
+    input_details = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
+
+    input_scale, input_zero_point = input_details[0]['quantization']
+    output_scale, output_zero_point = output_details[0]['quantization']
+
+    print("Input scale:", input_scale)
+    print("Input zero point:", input_zero_point)
+    print("Output scale:", output_scale)
+    print("Output zero point:", output_zero_point)
+
+def representative_data_gen():
+    num_samples = min(100, len(representative_train_X))
+    for i in range(num_samples):
+        sample = representative_train_X[i:i+1].astype(np.float32)
+        yield [sample]
+
+def pack_int4_pair(low, high):
+    low_u = np.uint8(low & 0x0F)
+    high_u = np.uint8(high & 0x0F)
+    return np.uint8(low_u | (high_u << 4))
+
+def export_wesad_eval_header(test_x, test_y, tflite_model_path, output_file="wesad_eval_data.h"):
+    interpreter = tf.lite.Interpreter(model_path=tflite_model_path)
+    interpreter.allocate_tensors()
+
+    input_details = interpreter.get_input_details()
+    input_scale, input_zero_point = input_details[0]['quantization']
+
+    print("TFLite input scale:", input_scale)
+    print("TFLite input zero point:", input_zero_point)
+
+    test_x_q = np.round(test_x / input_scale + input_zero_point)
+    test_x_q = np.clip(test_x_q, -128, 127).astype(np.int8)
+
+    num_samples = test_x_q.shape[0]
+    seq_len = test_x_q.shape[1]
+    num_features = test_x_q.shape[2]
+    sample_len = seq_len * num_features
+
+    test_x_flat = test_x_q.reshape(num_samples, sample_len)
+
+    with open(output_file, "w") as f:
+        f.write("#ifndef WESAD_EVAL_DATA_H_\n")
+        f.write("#define WESAD_EVAL_DATA_H_\n\n")
+        f.write("#include <stdint.h>\n\n")
+
+        f.write(f"const int g_wesad_eval_num_samples = {num_samples};\n")
+        f.write(f"const int g_wesad_eval_sample_len = {sample_len};\n\n")
+
+        f.write("const int8_t g_wesad_eval_x[] = {\n")
+        for s in range(num_samples):
+            f.write("  ")
+            for i, val in enumerate(test_x_flat[s]):
+                f.write(f"{int(val)}")
+                if not (s == num_samples - 1 and i == sample_len - 1):
+                    f.write(",")
+                f.write(" ")
+            f.write("\n")
+        f.write("};\n\n")
+
+        f.write("const uint8_t g_wesad_eval_y[] = {\n  ")
+        for i, label in enumerate(test_y):
+            f.write(f"{int(label)}")
+            if i != len(test_y) - 1:
+                f.write(", ")
+        f.write("\n};\n\n")
+
+        f.write("#endif\n")
+
+if __name__ == "__main__":
+    option = sys.argv[1]
+
+    data, feature_cols, label_col = load_data()
+    train_df, test_df = split_and_prepare_data(data, option)
+    model = train_model(train_df, test_df, option)
+
+    train_X = np.stack(train_df['X'].values)
+    test_X = np.stack(test_df['X'].values)
+    test_Y = test_df['y'].values
+
+    # IMPORTANT: first export tflite, then use it for header generation
+    export_tflite_model(model, train_X)
+    export_wesad_eval_header(test_X, test_Y, tflite_model_path="model_int8.tflite", output_file="wesad_eval_data.h")
