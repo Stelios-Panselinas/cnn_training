@@ -155,11 +155,11 @@ def split_and_prepare_data(data, option):
             sub_x_data = sub_x_data[indices]
             sub_y_data = sub_y_data[indices]
 
-            slipt = int(len(sub_x_data) * TRAIN_RATIO)
-            train_x_w = sub_x_data[:slipt]
-            train_y_w = sub_y_data[:slipt]
-            test_x_w = sub_x_data[slipt:]
-            test_y_w = sub_y_data[slipt:]
+            split = int(len(sub_x_data) * TRAIN_RATIO)
+            train_x_w = sub_x_data[:split]
+            train_y_w = sub_y_data[:split]
+            test_x_w = sub_x_data[split:]
+            test_y_w = sub_y_data[split:]
 
             train_x_w, test_x_w, scaler = normalize_data(train_x_w, test_x_w)
             # create DataFrames for this subject
