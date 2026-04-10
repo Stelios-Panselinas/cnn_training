@@ -16,9 +16,9 @@ SEQ_LEN = 32
 TRAIN_RATIO = 0.80
 NUM_CLASSES = 3
 FILTER1 = 8
-FILTER2 = 4
-KERNEL_SIZE = 2
-POOL_SIZE = 3
+FILTER2 = 16
+KERNEL_SIZE = 3
+POOL_SIZE = 2
 DENSE = 4
 BATCH = 4
 EPOCHS = 10
@@ -154,7 +154,6 @@ def split_and_prepare_data(data, option):
             indices = np.random.permutation(sub_x_data.shape[0])
             sub_x_data = sub_x_data[indices]
             sub_y_data = sub_y_data[indices]
-            print(f'length of sub_x_data: {len(sub_x_data)} and length of sub_y_data: {len(sub_y_data)}')
 
             slipt = int(len(sub_x_data) * TRAIN_RATIO)
             train_x_w = sub_x_data[:slipt]
@@ -185,6 +184,9 @@ def split_and_prepare_data(data, option):
         
         print(f'y test:{test_df['y'].unique()} y train:{train_df['y'].unique()}')
         print(f'distribution of y test: {test_df['y'].value_counts()} distribution of y train: {train_df['y'].value_counts()}')
+
+        train_df.to_csv('train_df.csv')
+        test_df.to_csv('test_df.csv')
         return train_df, test_df
     
     elif(option == '2'):
@@ -233,6 +235,19 @@ def split_and_prepare_data(data, option):
             'y': test_Y
         })
         return train_df, test_df
+
+def create_tflite_model_fp_io(model, train_X, output_path='model_int8_fp32_io.tflite'):
+    def representative_data_gen():
+        num_samples = min(100, len(train_X))
+        for i in range(num_samples):
+            sample = train_X[i:i+1].astype(np.float32)
+            yield [sample]
+
+    converter = tf.lite.TFLiteConverter.from_keras_model(model)
+    converter.optimazations = [tf.lite.Optimize.DEFAULT]
+    converter.representative_dataset = representative_data_gen
+
+    tflite_model_quant = converter.convert()
 
 def train_model(train_df, test_df, option):
     subjects = train_df['subject'].unique()
@@ -292,11 +307,15 @@ def train_model(train_df, test_df, option):
         )
     return model
 
-def export_tflite_model(model, train_X):
+def export_tflite_model(model, train_X, output_path="model_int8.tflite"):
+    def representative_data_gen():
+        num_samples = min(100, len(train_X))
+        for i in range(num_samples):
+            sample = train_X[i:i+1].astype(np.float32)
+            yield [sample]
+
     converter = tf.lite.TFLiteConverter.from_keras_model(model)
     converter.optimizations = [tf.lite.Optimize.DEFAULT]
-
-    # full integer quantization
     converter.representative_dataset = representative_data_gen
     converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
     converter.inference_input_type = tf.int8
@@ -304,12 +323,12 @@ def export_tflite_model(model, train_X):
 
     tflite_model = converter.convert()
 
-    with open("model_int8.tflite", "wb") as f:
+    with open(output_path, "wb") as f:
         f.write(tflite_model)
 
-    print("Saved fully quantized TFLite model: model_int8.tflite")
+    print(f"Saved fully quantized TFLite model: {output_path}")
 
-    interpreter = tf.lite.Interpreter(model_path=f"model_int8.tflite")
+    interpreter = tf.lite.Interpreter(model_path=output_path)
     interpreter.allocate_tensors()
 
     input_details = interpreter.get_input_details()
@@ -323,16 +342,7 @@ def export_tflite_model(model, train_X):
     print("Output scale:", output_scale)
     print("Output zero point:", output_zero_point)
 
-def representative_data_gen():
-    num_samples = min(100, len(train_X))
-    for i in range(num_samples):
-        sample = train_X[i:i+1].astype(np.float32)
-        yield [sample]
-
-def pack_int4_pair(low, high):
-    low_u = np.uint8(low & 0x0F)
-    high_u = np.uint8(high & 0x0F)
-    return np.uint8(low_u | (high_u << 4))
+    return output_path
 
 def export_wesad_eval_header(test_x, test_y, tflite_model_path, output_file="wesad_eval_data.h"):
     interpreter = tf.lite.Interpreter(model_path=tflite_model_path)
@@ -359,8 +369,9 @@ def export_wesad_eval_header(test_x, test_y, tflite_model_path, output_file="wes
         f.write("#define WESAD_EVAL_DATA_H_\n\n")
         f.write("#include <stdint.h>\n\n")
 
-        f.write(f"const int g_wesad_eval_num_samples = {num_samples};\n")
-        f.write(f"const int g_wesad_eval_sample_len = {sample_len};\n\n")
+        f.write(f"const int wesad__num_samples = {num_samples};\n")
+        f.write(f"const int g_wesad_eval_sample_len = {sample_len};\n")
+        f.write(f"static const int wesad__values_per_sample = {sample_len};\n\n")
 
         f.write("const int8_t g_wesad_eval_x[] = {\n")
         for s in range(num_samples):
@@ -368,8 +379,7 @@ def export_wesad_eval_header(test_x, test_y, tflite_model_path, output_file="wes
             for i, val in enumerate(test_x_flat[s]):
                 f.write(f"{int(val)}")
                 if not (s == num_samples - 1 and i == sample_len - 1):
-                    f.write(",")
-                f.write(" ")
+                    f.write(", ")
             f.write("\n")
         f.write("};\n\n")
 
@@ -382,14 +392,246 @@ def export_wesad_eval_header(test_x, test_y, tflite_model_path, output_file="wes
 
         f.write("#endif\n")
 
-if __name__ == "__main__":  
+    print(f"Saved eval header: {output_file}")
+
+def test_quantized_tflite_model(tflite_model_path, test_X, test_Y, num_classes=3):
+    interpreter = tf.lite.Interpreter(model_path=tflite_model_path)
+    interpreter.allocate_tensors()
+
+    input_details = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
+
+    input_scale, input_zero_point = input_details[0]["quantization"]
+    output_scale, output_zero_point = output_details[0]["quantization"]
+
+    print("=== TFLite Quantized Model Test ===")
+    print("Input dtype:", input_details[0]["dtype"])
+    print("Input shape:", input_details[0]["shape"])
+    print("Input scale:", input_scale)
+    print("Input zero point:", input_zero_point)
+    print("Output dtype:", output_details[0]["dtype"])
+    print("Output shape:", output_details[0]["shape"])
+    print("Output scale:", output_scale)
+    print("Output zero point:", output_zero_point)
+
+    preds = []
+
+    for i in range(len(test_X)):
+        sample = test_X[i:i+1].astype(np.float32)
+
+        # quantize input exactly as TFLite expects
+        sample_q = np.round(sample / input_scale + input_zero_point)
+        sample_q = np.clip(sample_q, -128, 127).astype(np.int8)
+
+        interpreter.set_tensor(input_details[0]["index"], sample_q)
+        interpreter.invoke()
+
+        output_data = interpreter.get_tensor(output_details[0]["index"])
+
+        if output_details[0]["dtype"] == np.int8:
+            pred = int(np.argmax(output_data[0]))
+        else:
+            pred = int(np.argmax(output_data[0]))
+
+        preds.append(pred)
+
+        if i < 5:
+            print(f"\nSample {i}")
+            print("True label:", int(test_Y[i]))
+            print("Pred label:", pred)
+            print("Quantized input first 16 vals:", sample_q.reshape(-1)[:16])
+            print("Raw output:", output_data[0])
+
+    preds = np.array(preds, dtype=np.int32)
+    test_Y = np.array(test_Y, dtype=np.int32)
+
+    acc = np.mean(preds == test_Y)
+    print("\n=== Results ===")
+    print(f"Accuracy: {acc * 100:.2f}%")
+
+    pred_counts = np.bincount(preds, minlength=num_classes)
+    label_counts = np.bincount(test_Y, minlength=num_classes)
+
+    print("Label counts:", label_counts)
+    print("Prediction counts:", pred_counts)
+
+    print("\nConfusion Matrix:")
+    print(confusion_matrix(test_Y, preds))
+
+    print("\nClassification Report:")
+    print(classification_report(test_Y, preds, digits=4))
+
+    return preds
+
+import re
+
+def load_wesad_eval_header_int8(header_path, seq_len=32, num_features=8):
+    with open(header_path, "r") as f:
+        text = f.read()
+
+    # metadata
+    num_samples_match = re.search(r'wesad__num_samples\s*=\s*(\d+)', text)
+    values_per_sample_match = re.search(r'wesad__values_per_sample\s*=\s*(\d+)', text)
+
+    if not num_samples_match:
+        raise ValueError("Could not find wesad__num_samples in header")
+    if not values_per_sample_match:
+        raise ValueError("Could not find wesad__values_per_sample in header")
+
+    num_samples = int(num_samples_match.group(1))
+    values_per_sample = int(values_per_sample_match.group(1))
+
+    # g_wesad_eval_x
+    x_match = re.search(
+        r'const\s+int8_t\s+g_wesad_eval_x\[\]\s*=\s*\{(.*?)\};',
+        text,
+        re.S
+    )
+    if not x_match:
+        raise ValueError("Could not find g_wesad_eval_x[] in header")
+
+    x_text = x_match.group(1)
+    x_vals = [int(v) for v in re.findall(r'-?\d+', x_text)]
+    x_vals = np.array(x_vals, dtype=np.int8)
+
+    expected_x_len = num_samples * values_per_sample
+    if len(x_vals) != expected_x_len:
+        raise ValueError(
+            f"g_wesad_eval_x length mismatch: got {len(x_vals)}, expected {expected_x_len}"
+        )
+
+    # g_wesad_eval_y
+    y_match = re.search(
+        r'const\s+uint8_t\s+g_wesad_eval_y\[\]\s*=\s*\{(.*?)\};',
+        text,
+        re.S
+    )
+    if not y_match:
+        raise ValueError("Could not find g_wesad_eval_y[] in header")
+
+    y_text = y_match.group(1)
+    y_vals = [int(v) for v in re.findall(r'\d+', y_text)]
+    y_vals = np.array(y_vals, dtype=np.uint8)
+
+    if len(y_vals) != num_samples:
+        raise ValueError(
+            f"g_wesad_eval_y length mismatch: got {len(y_vals)}, expected {num_samples}"
+        )
+
+    if values_per_sample != seq_len * num_features:
+        raise ValueError(
+            f"values_per_sample={values_per_sample}, but seq_len*num_features={seq_len * num_features}"
+        )
+
+    x_vals = x_vals.reshape(num_samples, seq_len, num_features)
+
+    return x_vals, y_vals, num_samples, values_per_sample
+
+def test_tflite_model_from_header(tflite_model_path, header_path, seq_len=32, num_features=8, num_classes=3):
+    test_X_q, test_Y, num_samples, values_per_sample = load_wesad_eval_header_int8(
+        header_path,
+        seq_len=seq_len,
+        num_features=num_features
+    )
+
+    interpreter = tf.lite.Interpreter(model_path=tflite_model_path)
+    interpreter.allocate_tensors()
+
+    input_details = interpreter.get_input_details()
+    output_details = interpreter.get_output_details()
+
+    input_scale, input_zero_point = input_details[0]["quantization"]
+    output_scale, output_zero_point = output_details[0]["quantization"]
+
+    print("=== TFLite Test From wesad_eval_data.h ===")
+    print("Model:", tflite_model_path)
+    print("Header:", header_path)
+    print("Input dtype:", input_details[0]["dtype"])
+    print("Input shape:", input_details[0]["shape"])
+    print("Input scale:", input_scale)
+    print("Input zero point:", input_zero_point)
+    print("Output dtype:", output_details[0]["dtype"])
+    print("Output shape:", output_details[0]["shape"])
+    print("Output scale:", output_scale)
+    print("Output zero point:", output_zero_point)
+    print("Loaded samples:", num_samples)
+    print("Values per sample:", values_per_sample)
+
+    preds = []
+
+    for i in range(num_samples):
+        sample_q = test_X_q[i:i+1].astype(np.int8)
+
+        interpreter.set_tensor(input_details[0]["index"], sample_q)
+        interpreter.invoke()
+
+        output_data = interpreter.get_tensor(output_details[0]["index"])
+        pred = int(np.argmax(output_data[0]))
+        preds.append(pred)
+
+        if i < 5:
+            print(f"\nSample {i}")
+            print("True label:", int(test_Y[i]))
+            print("Pred label:", pred)
+            print("Header input first 16 vals:", sample_q.reshape(-1)[:16])
+            print("Raw output:", output_data[0])
+
+    preds = np.array(preds, dtype=np.int32)
+    test_Y = np.array(test_Y, dtype=np.int32)
+
+    acc = np.mean(preds == test_Y)
+
+    print("\n=== Results ===")
+    print(f"Accuracy: {acc * 100:.2f}%")
+
+    label_counts = np.bincount(test_Y, minlength=num_classes)
+    pred_counts = np.bincount(preds, minlength=num_classes)
+
+    print("Label counts:", label_counts)
+    print("Prediction counts:", pred_counts)
+
+    print("\nConfusion Matrix:")
+    print(confusion_matrix(test_Y, preds))
+
+    print("\nClassification Report:")
+    print(classification_report(test_Y, preds, digits=4))
+
+    return preds, test_Y
+
+if __name__ == "__main__":
     option = sys.argv[1]
+
     data, feature_cols, label_col = load_data()
     train_df, test_df = split_and_prepare_data(data, option)
+    train_df = pd.read_csv('train_df.csv')
+    test_df = pd.read_csv('test_df.csv')
     model = train_model(train_df, test_df, option)
 
-    train_X = np.stack(train_df['X'].values)
-    test_X = np.stack(test_df['X'].values)
-    test_Y = test_df['y'].values
-    export_wesad_eval_header(test_X, test_Y, tflite_model_path=f"model_int8.tflite", output_file="wesad_eval_data.h")
-    export_tflite_model(model, train_X)
+    train_X = np.stack(train_df['X'].values).astype(np.float32)
+    test_X  = np.stack(test_df['X'].values).astype(np.float32)
+    test_Y  = test_df['y'].values.astype(np.uint8)
+
+    tflite_path = export_tflite_model(model, train_X, output_path="model_int8.tflite")
+
+    test_quantized_tflite_model(
+        tflite_model_path="model_int8.tflite",
+        test_X=test_X,
+        test_Y=test_Y,
+        num_classes=3
+    )
+
+    export_wesad_eval_header(
+        test_X,
+        test_Y,
+        tflite_model_path=tflite_path,
+        output_file="wesad_eval_data.h"
+    )
+
+    preds, labels = test_tflite_model_from_header(
+    tflite_model_path="model_int8.tflite",
+    header_path="wesad_eval_data.h",
+    seq_len=32,
+    num_features=8,
+    num_classes=3
+)
+print(os.path.getsize("model_int8.tflite"))
