@@ -248,6 +248,57 @@ def create_tflite_model_fp_io(model, train_X, output_path='model_int8_fp32_io.tf
     converter.representative_dataset = representative_data_gen
 
     tflite_model_quant = converter.convert()
+    with open(output_path, "wb") as f:
+        f.write(tflite_model_quant)
+
+    print(f"Saved fully quantized TFLite model: {output_path}")
+
+def test_tflite_model_fp_io(test_X, test_Y, model_path='model_int8_fp32_io.tflite'):
+    interpreter = tf.lite.Interpreter(model_path=model_path)
+    interpreter.allocate_tensors()
+
+    input_details = interpreter.get_input_details()[0]
+    output_details = interpreter.get_output_details()[0]
+
+    print("Input dtype:", input_details["dtype"])
+    print("Input shape:", input_details["shape"])
+    print("Output dtype:", output_details["dtype"])
+    print("Output shape:", output_details["shape"])
+
+    preds = []
+
+    for i in range(len(test_X)):
+        sample = test_X[i:i+1].astype(np.float32)
+
+        # Ensure shape matches model input
+        expected_shape = tuple(input_details["shape"])
+        if tuple(sample.shape) != expected_shape:
+            raise ValueError(f"Sample shape {sample.shape} does not match model input shape {expected_shape}")
+
+        # For fp32 input, pass the sample directly
+        interpreter.set_tensor(input_details["index"], sample)
+        interpreter.invoke()
+
+        output_data = interpreter.get_tensor(output_details["index"])
+
+        # For classification, prediction is argmax of output scores/probabilities
+        pred = int(np.argmax(output_data[0]))
+        preds.append(pred)
+
+        if i < 5:
+            print(f"\nSample {i}")
+            print("True label:", int(test_Y[i]))
+            print("Pred label:", pred)
+            print("Raw output:", output_data[0])
+
+    preds = np.array(preds, dtype=np.int32)
+    test_Y = np.array(test_Y, dtype=np.int32)
+
+    acc = np.mean(preds == test_Y)
+    print("\n=== Results ===")
+    print(f"Accuracy: {acc * 100:.2f}%")
+
+    return preds, acc
 
 def train_model(train_df, test_df, option):
     subjects = train_df['subject'].unique()
@@ -610,7 +661,8 @@ if __name__ == "__main__":
     train_X = np.stack(train_df['X'].values).astype(np.float32)
     test_X  = np.stack(test_df['X'].values).astype(np.float32)
     test_Y  = test_df['y'].values.astype(np.uint8)
-
+    create_tflite_model_fp_io(model,train_X)
+    test_tflite_model_fp_io(test_X, test_Y)
     tflite_path = export_tflite_model(model, train_X, output_path="model_int8.tflite")
 
     test_quantized_tflite_model(
