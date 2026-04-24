@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 import os
+os.environ["TF_USE_LEGACY_KERAS"] = "1"
 import sys
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
@@ -11,6 +12,7 @@ from tensorflow.keras.layers import Conv1D, MaxPooling1D, Flatten, Dense, Dropou
 from tensorflow.keras.optimizers import Adam
 from sklearn.utils.class_weight import compute_class_weight
 from sklearn.metrics import confusion_matrix, classification_report
+import tensorflow_model_optimization as tfmot
 
 SEQ_LEN = 32
 TRAIN_RATIO = 0.80
@@ -654,8 +656,8 @@ if __name__ == "__main__":
 
     data, feature_cols, label_col = load_data()
     train_df, test_df = split_and_prepare_data(data, option)
-    train_df = pd.read_csv('train_df.csv')
-    test_df = pd.read_csv('test_df.csv')
+    # train_df = pd.read_csv('train_df.csv')
+    # test_df = pd.read_csv('test_df.csv')
     model = train_model(train_df, test_df, option)
 
     train_X = np.stack(train_df['X'].values).astype(np.float32)
