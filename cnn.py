@@ -8,11 +8,11 @@ os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 from sklearn.preprocessing import StandardScaler
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import Conv1D, MaxPooling1D, Flatten, Dense, Dropout, GlobalAveragePooling1D, Input, BatchNormalization
+from tensorflow.keras.layers import Conv1D, MaxPooling1D, Flatten, Dense, Dropout, GlobalAveragePooling1D, Input, BatchNormalization, InputLayer
 from tensorflow.keras.optimizers import Adam
 from sklearn.utils.class_weight import compute_class_weight
 from sklearn.metrics import confusion_matrix, classification_report
-import tensorflow_model_optimization as tfmot
+# import tensorflow_model_optimization as tfmot
 
 SEQ_LEN = 32
 TRAIN_RATIO = 0.80
@@ -95,6 +95,27 @@ def normalize_data(X_train, X_test):
     X_test  = X_test_2d.reshape(n_test, seq_len, n_feat)
 
     return X_train, X_test, scaler
+
+def build_model(seq_len, num_features, num_classes=NUM_CLASSES):
+    model = Sequential([
+    InputLayer(input_shape=(seq_len, num_features)),
+
+    Conv1D(filters=FILTER1, kernel_size=KERNEL_SIZE, activation='relu', padding='same'),
+    MaxPooling1D(pool_size=POOL_SIZE),
+
+    Conv1D(filters=FILTER2, kernel_size=KERNEL_SIZE, activation='relu', padding='same'),
+
+    GlobalAveragePooling1D(),
+
+    Dense(3, activation='softmax')
+])
+    model.compile(
+        optimizer=Adam(learning_rate=1e-3),
+        loss='sparse_categorical_crossentropy',
+        metrics=['accuracy']
+    )
+
+    return model
 
 def build_cnn(seq_len, num_features, num_classes=NUM_CLASSES):
     model = Sequential([
@@ -330,7 +351,7 @@ def train_model(train_df, test_df, option):
 
         
         #.........
-        model = build_cnn(seq_len=SEQ_LEN, num_features=8, num_classes=NUM_CLASSES)
+        model = build_model(seq_len=SEQ_LEN, num_features=8, num_classes=NUM_CLASSES)
         history = model.fit(
         train_X, train_Y,
         validation_data=(test_X, test_Y),
@@ -343,6 +364,7 @@ def train_model(train_df, test_df, option):
         cm = confusion_matrix(test_Y, y_pred)
         print("Confusion Matrix:\n", cm)
         print(classification_report(test_Y, y_pred, digits=4))
+        model.save("model_new.h5", include_optimizer=False)
     elif(option == '2'):
         train_X = np.stack(train_df['X'].values)
         train_Y = train_df['y'].values
@@ -409,6 +431,53 @@ def export_wesad_eval_header(test_x, test_y, tflite_model_path, output_file="wes
 
     test_x_q = np.round(test_x / input_scale + input_zero_point)
     test_x_q = np.clip(test_x_q, -128, 127).astype(np.int8)
+
+    num_samples = test_x_q.shape[0]
+    seq_len = test_x_q.shape[1]
+    num_features = test_x_q.shape[2]
+    sample_len = seq_len * num_features
+
+    test_x_flat = test_x_q.reshape(num_samples, sample_len)
+
+    with open(output_file, "w") as f:
+        f.write("#ifndef WESAD_EVAL_DATA_H_\n")
+        f.write("#define WESAD_EVAL_DATA_H_\n\n")
+        f.write("#include <stdint.h>\n\n")
+
+        f.write(f"const int wesad__num_samples = {num_samples};\n")
+        f.write(f"const int g_wesad_eval_sample_len = {sample_len};\n")
+        f.write(f"static const int wesad__values_per_sample = {sample_len};\n\n")
+
+        f.write("const int8_t g_wesad_eval_x[] = {\n")
+        for s in range(num_samples):
+            f.write("  ")
+            for i, val in enumerate(test_x_flat[s]):
+                f.write(f"{int(val)}")
+                if not (s == num_samples - 1 and i == sample_len - 1):
+                    f.write(", ")
+            f.write("\n")
+        f.write("};\n\n")
+
+        f.write("const uint8_t g_wesad_eval_y[] = {\n  ")
+        for i, label in enumerate(test_y):
+            f.write(f"{int(label)}")
+            if i != len(test_y) - 1:
+                f.write(", ")
+        f.write("\n};\n\n")
+
+        f.write("#endif\n")
+
+    print(f"Saved eval header: {output_file}")
+
+def export_wesad_eval_header_int4(test_x, test_y, tflite_model_path, zero_point, scale, output_file="wesad_eval_data_int4.h"):
+    interpreter = tf.lite.Interpreter(model_path=tflite_model_path)
+    interpreter.allocate_tensors()
+
+    print("TFLite input scale:", scale)
+    print("TFLite input zero point:", zero_point)
+
+    test_x_q = np.round(test_x / scale + zero_point)
+    test_x_q = np.clip(test_x_q, -8, 7).astype(np.int8)
 
     num_samples = test_x_q.shape[0]
     seq_len = test_x_q.shape[1]
@@ -667,25 +736,12 @@ if __name__ == "__main__":
     test_tflite_model_fp_io(test_X, test_Y)
     tflite_path = export_tflite_model(model, train_X, output_path="model_int8.tflite")
 
-    test_quantized_tflite_model(
-        tflite_model_path="model_int8.tflite",
-        test_X=test_X,
-        test_Y=test_Y,
-        num_classes=3
-    )
+    # export_wesad_eval_header(test_X, test_Y, tflite_model_path=tflite_path, output_file="wesad_eval_data.h")
 
-    export_wesad_eval_header(
-        test_X,
-        test_Y,
-        tflite_model_path=tflite_path,
-        output_file="wesad_eval_data.h"
-    )
+    # export_wesad_eval_header_int4(test_X, test_Y, tflite_model_path=tflite_path, zero_point=int4_zero_point, scale=int4_scale, output_file="wesad_eval_data_int4.h")
 
-    preds, labels = test_tflite_model_from_header(
-    tflite_model_path="model_int8.tflite",
-    header_path="wesad_eval_data.h",
-    seq_len=32,
-    num_features=8,
-    num_classes=3
-)
-print(os.path.getsize("model_int8.tflite"))
+    # test_quantized_tflite_model(tflite_model_path="model_int8.tflite", test_X=test_X, test_Y=test_Y, num_classes=3)
+
+    # preds, labels = test_tflite_model_from_header(tflite_model_path="model_int8.tflite", header_path="wesad_eval_data.h", seq_len=32, num_features=8, num_classes=3)
+    # preds, labels = test_tflite_model_from_header(tflite_model_path="model_int8.tflite", header_path="wesad_eval_data_int4.h", seq_len=32, num_features=8, num_classes=3)
+  
