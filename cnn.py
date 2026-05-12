@@ -12,6 +12,8 @@ from tensorflow.keras.layers import Conv1D, MaxPooling1D, Flatten, Dense, Dropou
 from tensorflow.keras.optimizers import Adam
 from sklearn.utils.class_weight import compute_class_weight
 from sklearn.metrics import confusion_matrix, classification_report
+import re
+from keras.models import load_model
 # import tensorflow_model_optimization as tfmot
 
 SEQ_LEN = 32
@@ -396,6 +398,9 @@ def export_tflite_model(model, train_X, output_path="model_int8.tflite"):
     converter.inference_input_type = tf.int8
     converter.inference_output_type = tf.int8
 
+    # Important for your current TFLite Micro FC kernel
+    converter._experimental_disable_per_channel = True
+    
     tflite_model = converter.convert()
 
     with open(output_path, "wb") as f:
@@ -417,7 +422,6 @@ def export_tflite_model(model, train_X, output_path="model_int8.tflite"):
     print("Output scale:", output_scale)
     print("Output zero point:", output_zero_point)
 
-    return output_path
 
 def export_wesad_eval_header(test_x, test_y, tflite_model_path, output_file="wesad_eval_data.h"):
     interpreter = tf.lite.Interpreter(model_path=tflite_model_path)
@@ -543,9 +547,9 @@ def test_quantized_tflite_model(tflite_model_path, test_X, test_Y, num_classes=3
 
         # quantize input exactly as TFLite expects
         sample_q = np.round(sample / input_scale + input_zero_point)
-        sample_q = np.clip(sample_q, -128, 127).astype(np.int8)
+        sample_q = np.clip(sample_q, -128, 127).astype(np.float32)
 
-        interpreter.set_tensor(input_details[0]["index"], sample_q)
+        interpreter.set_tensor(input_details["index"], sample_q)
         interpreter.invoke()
 
         output_data = interpreter.get_tensor(output_details[0]["index"])
@@ -584,8 +588,6 @@ def test_quantized_tflite_model(tflite_model_path, test_X, test_Y, num_classes=3
     print(classification_report(test_Y, preds, digits=4))
 
     return preds
-
-import re
 
 def load_wesad_eval_header_int8(header_path, seq_len=32, num_features=8):
     with open(header_path, "r") as f:
@@ -695,7 +697,7 @@ def test_tflite_model_from_header(tflite_model_path, header_path, seq_len=32, nu
             print(f"\nSample {i}")
             print("True label:", int(test_Y[i]))
             print("Pred label:", pred)
-            print("Header input first 16 vals:", sample_q.reshape(-1)[:16])
+            print("Header input first 32 vals:", sample_q.reshape(-1)[:32])
             print("Raw output:", output_data[0])
 
     preds = np.array(preds, dtype=np.int32)
@@ -718,7 +720,92 @@ def test_tflite_model_from_header(tflite_model_path, header_path, seq_len=32, nu
     print("\nClassification Report:")
     print(classification_report(test_Y, preds, digits=4))
 
-    return preds, test_Y
+    # return preds, test_Y
+
+def export_header_int4_precision(test_X, test_y):
+    MODEL_PATH = "./exported_models/model_int4_precision.tflite"
+    OUTPUT_HEADER = "./exported_headers/wesad_test_data_int4_precision.h"
+
+    # your float test set
+    # shape example: (num_samples, 32, 8)
+    # test_X = np.load("test_X.npy").astype(np.float32)
+
+    interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
+    interpreter.allocate_tensors()
+
+    input_details = interpreter.get_input_details()[0]
+
+    scale = input_details["quantization"][0]
+    zero_point = input_details["quantization"][1]
+
+    print("Input scale:", scale)
+    print("Input zero point:", zero_point)
+    print("Input dtype:", input_details["dtype"])
+    print("Input shape:", input_details["shape"])
+
+    # --------------------------------------------------
+    # Quantize input data using TFLite parameters
+    # --------------------------------------------------
+
+    test_X_quant = np.round(test_X / scale + zero_point)
+
+    # model is stored as int8
+    test_X_quant = np.clip(test_X_quant, -128, 127).astype(np.int8)
+
+    print("Quantized shape:", test_X_quant.shape)
+    print("Min:", test_X_quant.min(), "Max:", test_X_quant.max())
+
+    # --------------------------------------------------
+    # Export to C header file
+    # --------------------------------------------------
+
+    num_samples = test_X_quant.shape[0]
+    seq_len = test_X_quant.shape[1]
+    num_features = test_X_quant.shape[2]
+    sample_len = seq_len * num_features
+
+        # keep samples separate
+    test_x_flat = test_X_quant.reshape(test_X_quant.shape[0], -1)
+
+    for s in range(test_x_flat.shape[0]):
+        for i, val in enumerate(test_x_flat[s]):
+            # val is one int4 value stored as int8
+            pass
+
+    with open(OUTPUT_HEADER, "w") as f:
+        f.write("#ifndef WESAD_EVAL_DATA_H_\n")
+        f.write("#define WESAD_EVAL_DATA_H_\n\n")
+        f.write("#include <stdint.h>\n\n")
+
+        f.write(f"const int wesad__num_samples = {num_samples};\n")
+        f.write(f"const int g_wesad_eval_sample_len = {sample_len};\n")
+        f.write(f"static const int wesad__values_per_sample = {sample_len};\n\n")
+
+        f.write("const int8_t g_wesad_eval_x[] = {\n")
+        for s in range(num_samples):
+            f.write("  ")
+            for i, val in enumerate(test_x_flat[s]):
+                f.write(f"{int(val)}")
+                if not (s == num_samples - 1 and i == sample_len - 1):
+                    f.write(", ")
+            f.write("\n")
+        f.write("};\n\n")
+
+        f.write("const uint8_t g_wesad_eval_y[] = {\n  ")
+        for i, label in enumerate(test_y):
+            f.write(f"{int(label)}")
+            if i != len(test_y) - 1:
+                f.write(", ")
+        f.write("\n};\n\n")
+
+        f.write("#endif\n")
+
+    print(f"Saved header file: {OUTPUT_HEADER}")
+
+def parse_array_string(s):
+    s = s.replace("[", " ").replace("]", " ")
+    arr = np.fromstring(s, sep=" ", dtype=np.float32)
+    return arr.reshape(32, 8)
 
 if __name__ == "__main__":
     option = sys.argv[1]
@@ -729,19 +816,31 @@ if __name__ == "__main__":
     # test_df = pd.read_csv('test_df.csv')
     model = train_model(train_df, test_df, option)
 
-    train_X = np.stack(train_df['X'].values).astype(np.float32)
-    test_X  = np.stack(test_df['X'].values).astype(np.float32)
+    train_X = np.stack(train_df["X"].apply(parse_array_string).values).astype(np.float32)
+    test_X  = np.stack(test_df["X"].apply(parse_array_string).values).astype(np.float32)
     test_Y  = test_df['y'].values.astype(np.uint8)
-    create_tflite_model_fp_io(model,train_X)
-    test_tflite_model_fp_io(test_X, test_Y)
+
+    # train_X = np.stack(train_df['X'].values)
+    # train_Y = train_df['y'].values
+
+    # test_X = np.stack(test_df['X'].values)
+    # test_Y = test_df['y'].values
+    # export_tflite_model(model=model,train_X=train_X)
+    # create_tflite_model_fp_io(model,train_X)
+    # test_tflite_model_fp_io(test_X, test_Y)
+    model = load_model('model_new.h5')
     tflite_path = export_tflite_model(model, train_X, output_path="model_int8.tflite")
 
-    # export_wesad_eval_header(test_X, test_Y, tflite_model_path=tflite_path, output_file="wesad_eval_data.h")
+    # rep_data = train_X[:500].astype(np.float32)
+
+    # np.save("representative_data.npy", rep_data)
+    # export_header_int4_precision(test_X=test_X, test_y=test_Y)
+    export_wesad_eval_header(test_X, test_Y, tflite_model_path='model_int8.tflite', output_file="wesad_eval_data.h")
 
     # export_wesad_eval_header_int4(test_X, test_Y, tflite_model_path=tflite_path, zero_point=int4_zero_point, scale=int4_scale, output_file="wesad_eval_data_int4.h")
 
-    # test_quantized_tflite_model(tflite_model_path="model_int8.tflite", test_X=test_X, test_Y=test_Y, num_classes=3)
+    # test_quantized_tflite_model(tflite_model_path="./exported_models/model_int4_precision.tflite", test_X=test_X, test_Y=test_Y, num_classes=3)
 
-    # preds, labels = test_tflite_model_from_header(tflite_model_path="model_int8.tflite", header_path="wesad_eval_data.h", seq_len=32, num_features=8, num_classes=3)
+    # preds, labels = test_tflite_model_from_header(tflite_model_path="./exported_models/model_int4_precision.tflite", header_path="./exported_headers/wesad_test_data_int4_precision.h", seq_len=32, num_features=8, num_classes=3)
     # preds, labels = test_tflite_model_from_header(tflite_model_path="model_int8.tflite", header_path="wesad_eval_data_int4.h", seq_len=32, num_features=8, num_classes=3)
-  
+    # test_tflite_model_from_header(tflite_model_path='model_int8.tflite', header_path='wesad_eval_data.h')
